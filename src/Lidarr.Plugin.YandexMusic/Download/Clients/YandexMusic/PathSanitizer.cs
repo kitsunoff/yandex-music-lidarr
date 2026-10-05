@@ -9,7 +9,15 @@ namespace NzbDrone.Core.Download.Clients.YandexMusic
         private const int MaxComponentBytes = 250;
 
         public static string Sanitize(string component)
+            => Sanitize(component, MaxComponentBytes);
+
+        public static string Sanitize(string component, int maxBytes)
         {
+            if (maxBytes < 1)
+            {
+                throw new ArgumentOutOfRangeException(nameof(maxBytes));
+            }
+
             if (string.IsNullOrWhiteSpace(component))
             {
                 return "_";
@@ -21,12 +29,14 @@ namespace NzbDrone.Core.Download.Clients.YandexMusic
             {
                 builder.Append(invalid.Contains(ch) || ch == '/' || ch == '\\' ? '_' : ch);
             }
+
             var cleaned = builder.ToString().Trim('.', ' ', '_');
             if (cleaned.Length == 0)
             {
                 return "_";
             }
-            return TruncateToBytes(cleaned, MaxComponentBytes);
+
+            return TruncateToBytes(cleaned, maxBytes);
         }
 
         private static string TruncateToBytes(string value, int maxBytes)

@@ -47,7 +47,7 @@ namespace NzbDrone.Core.Download.Clients.YandexMusic
         public int Quality { get; set; }
 
         [FieldDefinition(3, Label = "Embed Lyrics", Type = FieldType.Checkbox,
-            HelpText = "Pull synced lyrics and embed them into the audio file tag.")]
+            HelpText = "Download lyrics from Yandex.Music and embed them into the audio file tag. Plain text is preferred; synced LRC is used as a fallback.")]
         public bool EmbedLyrics { get; set; }
 
         [FieldDefinition(4, Label = "Cover Resolution", Type = FieldType.Select,

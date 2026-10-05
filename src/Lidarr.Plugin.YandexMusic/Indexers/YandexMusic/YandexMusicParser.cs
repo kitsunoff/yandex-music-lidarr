@@ -33,20 +33,8 @@ namespace NzbDrone.Core.Indexers.YandexMusic
                 return Array.Empty<ReleaseInfo>();
             }
 
-            SearchResult? searchResult;
-            try
-            {
-                var envelope = JsonSerializer.Deserialize<YandexResponse<SearchResult>>(
-                    indexerResponse.Content,
-                    YandexMusicHttpClient.JsonOptions);
-                searchResult = envelope?.Result;
-            }
-            catch (JsonException)
-            {
-                return Array.Empty<ReleaseInfo>();
-            }
-
-            if (searchResult?.Albums?.Results is not { Count: > 0 } albums)
+            var albums = ParseAlbums(indexerResponse.Content);
+            if (albums.Count == 0)
             {
                 return Array.Empty<ReleaseInfo>();
             }
@@ -68,13 +56,54 @@ namespace NzbDrone.Core.Indexers.YandexMusic
             return releases;
         }
 
+        private static IReadOnlyList<Album> ParseAlbums(string content)
+        {
+            // Normal fuzzy search response: { result: { albums: { results: [...] } } }
+            try
+            {
+                var searchEnvelope = JsonSerializer.Deserialize<YandexResponse<SearchResult>>(
+                    content,
+                    YandexMusicHttpClient.JsonOptions);
+                if (searchEnvelope?.Result?.Albums?.Results is { Count: > 0 } searchAlbums)
+                {
+                    return searchAlbums;
+                }
+            }
+            catch (JsonException)
+            {
+                // Try the direct album response below.
+            }
+
+            // Metadata-aware lookup response from /albums/{id}/with-tracks:
+            // { result: { id, title, artists, ... } }
+            try
+            {
+                var albumEnvelope = JsonSerializer.Deserialize<YandexResponse<Album>>(
+                    content,
+                    YandexMusicHttpClient.JsonOptions);
+                if (albumEnvelope?.Result is { Id: > 0 } directAlbum
+                    && !string.IsNullOrWhiteSpace(directAlbum.Title))
+                {
+                    return new[] { directAlbum };
+                }
+            }
+            catch (JsonException)
+            {
+                // Invalid/unsupported responses simply yield no releases, matching the
+                // previous parser behaviour.
+            }
+
+            return Array.Empty<Album>();
+        }
+
         private static IEnumerable<ReleaseInfo> BuildReleasesForAlbum(Album album)
         {
             var artistName = ResolveArtistName(album);
             var albumTitle = ComposeTitle(album.Title, album.Version);
             var year = album.Year ?? ParseYear(album.ReleaseDate);
             var publishDate = ParsePublishDate(album.ReleaseDate, album.Year);
-            var trackCount = Math.Max(album.TrackCount, 1);
+            var trackCount = Math.Max(album.TrackCount, album.Volumes?.Sum(v => v.Count) ?? 0);
+            trackCount = Math.Max(trackCount, 1);
 
             foreach (var (quality, codec, container, suffix, bitrate) in QualityMatrix)
             {
@@ -141,7 +170,7 @@ namespace NzbDrone.Core.Indexers.YandexMusic
 
         private static long EstimateSize(int trackCount, int bitrateKbps)
         {
-            // Rough estimate: average song length 3.5 minutes.  Actual size is determined at
+            // Rough estimate: average song length 3.5 minutes. Actual size is determined at
             // download time from the get-file-info response (which includes a precise size).
             const double averageTrackMinutes = 3.5;
             var seconds = trackCount * averageTrackMinutes * 60;

@@ -126,6 +126,37 @@ namespace NzbDrone.Core.Download.Clients.YandexMusic.Queue
                     return;
                 }
 
+                CoverArtData? coverArt = null;
+                var coverUri = !string.IsNullOrWhiteSpace(album.CoverUri)
+                    ? album.CoverUri
+                    : tracks.Select(t => t.CoverUri).FirstOrDefault(uri => !string.IsNullOrWhiteSpace(uri));
+                if (!string.IsNullOrWhiteSpace(coverUri))
+                {
+                    try
+                    {
+                        coverArt = await CoverArtUtilities
+                            .DownloadAsync(coverUri, (YandexMusicCoverResolutionOption)_settings.CoverResolution, cancellationToken)
+                            .ConfigureAwait(false);
+
+                        if (coverArt is not null)
+                        {
+                            _logger?.Info(
+                                "Yandex.Music album {0}: downloaded cover art ({1}, {2} bytes).",
+                                album.Id,
+                                coverArt.MimeType,
+                                coverArt.Bytes.Length);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.Warn(ex, "Failed to download cover art for Yandex.Music album {0}; tracks will be downloaded without embedded artwork.", album.Id);
+                    }
+                }
+                else
+                {
+                    _logger?.Warn("Yandex.Music album {0} does not contain a coverUri; tracks will be downloaded without embedded artwork.", album.Id);
+                }
+
                 // Refine TotalSize from actual track durations + the nominal bitrate of
                 // the requested quality.  The indexer-side estimate uses an
                 // 3.5 min average track length; the precise total comes from the
@@ -142,7 +173,7 @@ namespace NzbDrone.Core.Download.Clients.YandexMusic.Queue
                     {
                         try
                         {
-                            await DownloadTrackAsync(client, track, album, albumFolder, item, cancellationToken).ConfigureAwait(false);
+                            await DownloadTrackAsync(client, track, album, albumFolder, item, coverArt, cancellationToken).ConfigureAwait(false);
                         }
                         finally
                         {
@@ -177,6 +208,7 @@ namespace NzbDrone.Core.Download.Clients.YandexMusic.Queue
             Album album,
             string albumFolder,
             DownloadItem item,
+            CoverArtData? coverArt,
             CancellationToken cancellationToken)
         {
             if (_settings is null)
@@ -220,39 +252,160 @@ namespace NzbDrone.Core.Download.Clients.YandexMusic.Queue
 
             var fileName = TrackFileNamer.BuildFileName(track, album, info);
             var fullPath = Path.Combine(albumFolder, fileName);
-
-            // Stream the encrypted CDN body through the AES-CTR transformer straight
-            // to disk - no buffering of multi-MB FLAC payloads in process memory.
-            // Per-chunk progress reports drive the queue's ETA estimate.
-            var lastReported = 0L;
-            var progress = new Progress<long>(bytesSoFar =>
-            {
-                var delta = bytesSoFar - lastReported;
-                if (delta > 0)
-                {
-                    Interlocked.Add(ref item.DownloadedSizeField, delta);
-                    lastReported = bytesSoFar;
-                }
-            });
-
-            await using (var output = new FileStream(fullPath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 64 * 1024, useAsync: true))
-            {
-                await client.DownloadDecryptedToAsync(info, output, progress, cancellationToken).ConfigureAwait(false);
-            }
+            var temporaryPath = BuildTemporaryTrackPath(albumFolder);
 
             try
             {
-                MetadataUtilities.WriteTags(fullPath, track, album, item.RemoteAlbum);
+                // Stream into a same-directory temporary file first.  The final path is
+                // never exposed to Lidarr until the encrypted body has been downloaded,
+                // decrypted and tagged successfully enough to keep the track.  The
+                // temporary path ends in .tmp so even an orphan from a hard crash is not
+                // an importable audio file; TagLib# receives the real media type explicitly.
+                // Per-chunk progress reports drive the queue's ETA estimate.
+                var lastReported = 0L;
+                var progress = new Progress<long>(bytesSoFar =>
+                {
+                    // A CDN fallback restarts its cumulative byte counter from zero.
+                    // Do not subtract the bytes from the failed attempt; once the new
+                    // attempt passes that high-water mark, only genuinely new progress
+                    // is added and the final counter still converges on file size.
+                    var delta = bytesSoFar - lastReported;
+                    if (delta > 0)
+                    {
+                        Interlocked.Add(ref item.DownloadedSizeField, delta);
+                        lastReported = bytesSoFar;
+                    }
+                });
+
+                await using (var output = new FileStream(
+                                 temporaryPath,
+                                 FileMode.CreateNew,
+                                 FileAccess.Write,
+                                 FileShare.None,
+                                 bufferSize: 64 * 1024,
+                                 useAsync: true))
+                {
+                    await client.DownloadDecryptedToAsync(info, output, progress, cancellationToken).ConfigureAwait(false);
+                }
+
+                string? lyrics = null;
+                if (_settings.EmbedLyrics)
+                {
+                    lyrics = await TryGetLyricsAsync(client, trackId, track, cancellationToken).ConfigureAwait(false);
+                }
+
+                try
+                {
+                    MetadataUtilities.WriteTags(
+                        temporaryPath,
+                        track,
+                        album,
+                        item.RemoteAlbum,
+                        coverArt,
+                        lyrics,
+                        Path.GetExtension(fullPath));
+                }
+                catch (Exception ex)
+                {
+                    _logger?.Warn(ex, "Failed to write tags to temporary track {0}; keeping the downloaded audio without updated tags.", temporaryPath);
+                }
+
+                // Same-directory rename keeps the publish step on one filesystem and is
+                // atomic on the normal Lidarr filesystems.  Existing files are replaced
+                // only after the new track is complete.
+                File.Move(temporaryPath, fullPath, overwrite: true);
             }
-            catch (Exception ex)
+            finally
             {
-                _logger?.Warn(ex, "Failed to write tags to {0}; the file is still on disk.", fullPath);
+                // Cancellation, a broken CDN, a tagging crash or a failed rename must
+                // never leave .tmp audio for Lidarr to import later.
+                TryDeleteTemporaryFile(temporaryPath);
             }
 
             if (_settings.DownloadDelayMs > 0)
             {
                 await Task.Delay(_settings.DownloadDelayMs, cancellationToken).ConfigureAwait(false);
             }
+        }
+
+        private static string BuildTemporaryTrackPath(string albumFolder)
+        {
+            // Keep the temporary file non-audio by extension so an orphan left after a
+            // hard process crash cannot be mistaken for an importable track.  TagLib#
+            // is given the real final extension explicitly when tags are written.
+            return Path.Combine(albumFolder, $".ym-{Guid.NewGuid():N}.tmp");
+        }
+
+        private void TryDeleteTemporaryFile(string temporaryPath)
+        {
+            try
+            {
+                if (File.Exists(temporaryPath))
+                {
+                    File.Delete(temporaryPath);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.Warn(ex, "Failed to remove temporary Yandex.Music download {0}.", temporaryPath);
+            }
+        }
+
+        private async Task<string?> TryGetLyricsAsync(
+            YandexMusicClient client,
+            long trackId,
+            Track track,
+            CancellationToken cancellationToken)
+        {
+            var lyricsInfo = track.LyricsInfo;
+            if (lyricsInfo is null || (!lyricsInfo.HasAvailableTextLyrics && !lyricsInfo.HasAvailableSyncLyrics))
+            {
+                _logger?.Debug("Yandex.Music track {0} ({1}) has no available lyrics.", track.Id, track.Title);
+                return null;
+            }
+
+            // TEXT is best suited to the common embedded-lyrics tag used by MP3/M4A/FLAC.
+            // If Yandex exposes only synchronized lyrics, retain the LRC timestamps in that
+            // same field instead of discarding lyrics altogether.
+            if (lyricsInfo.HasAvailableTextLyrics)
+            {
+                try
+                {
+                    var text = await client.Lyrics
+                        .GetAsync(trackId, track.DurationMs, LyricsFormat.Text, cancellationToken)
+                        .ConfigureAwait(false);
+                    _logger?.Info("Yandex.Music track {0} ({1}): embedded TEXT lyrics ({2} characters).", track.Id, track.Title, text.Length);
+                    return text;
+                }
+                catch (Exception ex)
+                {
+                    if (!lyricsInfo.HasAvailableSyncLyrics)
+                    {
+                        _logger?.Warn(ex, "Failed to download lyrics for Yandex.Music track {0} ({1}); continuing without embedded lyrics.", track.Id, track.Title);
+                        return null;
+                    }
+
+                    _logger?.Warn(ex, "Failed to download TEXT lyrics for Yandex.Music track {0} ({1}); trying synchronized LRC instead.", track.Id, track.Title);
+                }
+            }
+
+            if (lyricsInfo.HasAvailableSyncLyrics)
+            {
+                try
+                {
+                    var lrc = await client.Lyrics
+                        .GetAsync(trackId, track.DurationMs, LyricsFormat.Lrc, cancellationToken)
+                        .ConfigureAwait(false);
+                    _logger?.Info("Yandex.Music track {0} ({1}): embedded LRC lyrics ({2} characters).", track.Id, track.Title, lrc.Length);
+                    return lrc;
+                }
+                catch (Exception ex)
+                {
+                    _logger?.Warn(ex, "Failed to download synchronized lyrics for Yandex.Music track {0} ({1}); continuing without embedded lyrics.", track.Id, track.Title);
+                }
+            }
+
+            return null;
         }
 
         private static string BuildAlbumFolder(string root, Album album)

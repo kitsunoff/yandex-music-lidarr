@@ -28,6 +28,7 @@ public sealed class YandexMusicClient : IDisposable
         Albums = new AlbumsClient(_http);
         Artists = new ArtistsClient(_http);
         Downloads = new DownloadInfoClient(_http);
+        Lyrics = new LyricsClient(_http);
     }
 
     public SearchClient Search { get; }
@@ -37,6 +38,8 @@ public sealed class YandexMusicClient : IDisposable
     public ArtistsClient Artists { get; }
 
     public DownloadInfoClient Downloads { get; }
+
+    public LyricsClient Lyrics { get; }
 
     /// <summary>
     /// Fetches the first available CDN URL listed in <paramref name="info"/>,
@@ -65,9 +68,12 @@ public sealed class YandexMusicClient : IDisposable
             throw new YandexMusicException("DownloadInfo is missing an AES decryption key - was the encraw transport requested?");
         }
 
+        var startPosition = destination.CanSeek ? destination.Position : 0L;
         Exception? lastError = null;
-        foreach (var url in info.Urls)
+
+        for (var urlIndex = 0; urlIndex < info.Urls.Count; urlIndex++)
         {
+            var url = info.Urls[urlIndex];
             try
             {
                 using var decryptor = new AesCtrStream(Convert.FromHexString(info.Key));
@@ -86,13 +92,47 @@ public sealed class YandexMusicClient : IDisposable
                 }
                 return;
             }
-            catch (Exception ex) when (ex is HttpRequestException or YandexMusicException or IOException)
+            catch (Exception ex) when (IsCdnTransportFailure(ex, cancellationToken))
             {
                 lastError = ex;
+
+                if (urlIndex == info.Urls.Count - 1)
+                {
+                    break;
+                }
+
+                // A failed CDN may have already written a partial decrypted payload.
+                // Rewinding without truncating would append the next CDN attempt to that
+                // partial file and silently corrupt the track.  FileStream/MemoryStream,
+                // which are the supported destinations in this library, can be rolled
+                // back safely to the position they had before the first attempt.
+                if (!destination.CanSeek)
+                {
+                    throw new YandexMusicException(
+                        "A CDN download failed after writing to a non-seekable destination; safe fallback is impossible without risking a corrupted track.",
+                        ex);
+                }
+
+                destination.SetLength(startPosition);
+                destination.Position = startPosition;
             }
         }
 
         throw new YandexMusicException("All CDN URLs failed to deliver the encrypted track.", lastError!);
+    }
+
+
+    private static bool IsCdnTransportFailure(Exception exception, CancellationToken cancellationToken)
+    {
+        if (exception is OperationCanceledException)
+        {
+            // Preserve an explicit caller cancellation.  HttpClient also uses
+            // TaskCanceledException/OperationCanceledException for request timeouts;
+            // those are transport failures and may safely fall back to another CDN.
+            return !cancellationToken.IsCancellationRequested;
+        }
+
+        return exception is HttpRequestException or YandexMusicException or IOException;
     }
 
     /// <summary>
